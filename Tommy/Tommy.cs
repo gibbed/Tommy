@@ -441,6 +441,7 @@ namespace Tommy
     public class TomlTable : TomlNode
     {
         private Dictionary<string, TomlNode> children;
+        internal bool isImplicit;
         
         public override bool HasValue { get; } = false;
         public override bool IsTable { get; } = true;
@@ -1186,10 +1187,10 @@ namespace Tommy
 
             // Normalize by removing space separator
             value = value.Replace(TomlSyntax.RFC3339EmptySeparator, TomlSyntax.ISO861Separator);
-            if (StringUtils.TryParseDateTime(value,
+            if (StringUtils.TryParseDateTime<DateTime>(value,
                                              TomlSyntax.RFC3339LocalDateTimeFormats,
                                              DateTimeStyles.AssumeLocal,
-                                             DateTime.ParseExact,
+                                             DateTime.TryParseExact,
                                              out var dateTimeResult,
                                              out var precision))
                 return new TomlDateTimeLocal
@@ -1212,7 +1213,7 @@ namespace Tommy
             if (StringUtils.TryParseDateTime(value,
                                              TomlSyntax.RFC3339LocalTimeFormats,
                                              DateTimeStyles.AssumeLocal,
-                                             DateTime.ParseExact,
+                                             DateTime.TryParseExact,
                                              out dateTimeResult,
                                              out precision))
                 return new TomlDateTimeLocal
@@ -1222,12 +1223,12 @@ namespace Tommy
                     SecondsPrecision = precision
                 };
             
-            if (StringUtils.TryParseDateTime(value,
-                                             TomlSyntax.RFC3339Formats,
-                                             DateTimeStyles.None,
-                                             DateTimeOffset.ParseExact,
-                                             out var dateTimeOffsetResult,
-                                             out precision))
+            if (StringUtils.TryParseDateTime<DateTimeOffset>(value,
+                                                             TomlSyntax.RFC3339Formats,
+                                                             DateTimeStyles.None,
+                                                             DateTimeOffset.TryParseExact,
+                                                             out var dateTimeOffsetResult,
+                                                             out precision))
                 return new TomlDateTimeOffset
                 {
                     Value = dateTimeOffsetResult,
@@ -1252,6 +1253,7 @@ namespace Tommy
             ConsumeChar();
             var result = new TomlArray();
             TomlNode currentValue = null;
+            var expectValue = true;
 
             int cur;
             while ((cur = reader.Peek()) >= 0)
@@ -1282,15 +1284,21 @@ namespace Tommy
                 {
                     if (currentValue == null)
                     {
-                        AddError("Encountered multiple value separators in an array!");
+                        AddError("Encountered multiple value separators");
                         return null;
                     }
 
                     result.Add(currentValue);
                     currentValue = null;
+                    expectValue = true;
                     goto consume_character;
                 }
 
+                if (!expectValue)
+                {
+                    AddError("Missing separator between values");
+                    return null;
+                }
                 currentValue = ReadValue(true);
                 if (currentValue == null)
                 {
@@ -1298,6 +1306,7 @@ namespace Tommy
                         AddError("Failed to determine and parse a value!");
                     return null;
                 }
+                expectValue = false;
 
                 continue;
                 consume_character:
@@ -1710,10 +1719,16 @@ namespace Tommy
                         latestNode = arr[arr.ChildrenCount - 1];
                         continue;
                     }
+                    
+                    if (node is TomlTable { IsInline: true })
+                    {
+                        AddError($"Cannot create table {".".Join(path)} because it will edit an immutable table.");
+                        return null;
+                    }
 
                     if (node.HasValue)
                     {
-                        if (!(node is TomlArray array) || !array.IsTableArray)
+                        if (node is not TomlArray { IsTableArray: true } array)
                         {
                             AddError($"The key {".".Join(path)} has a value assigned to it!");
                             return null;
@@ -1731,7 +1746,7 @@ namespace Tommy
                             return null;
                         }
 
-                        if (node is TomlTable tbl && !tbl.IsInline)
+                        if (node is TomlTable { isImplicit: false })
                         {
                             AddError($"The table {".".Join(path)} is defined multiple times!");
                             return null;
@@ -1753,10 +1768,7 @@ namespace Tommy
                         break;
                     }
 
-                    node = new TomlTable
-                    {
-                        IsInline = true
-                    };
+                    node = new TomlTable { isImplicit = true };
                     latestNode[subkey] = node;
                 }
 
@@ -1764,6 +1776,7 @@ namespace Tommy
             }
 
             var result = (TomlTable) latestNode;
+            result.isImplicit = false;
             return result;
         }
 
@@ -2023,10 +2036,12 @@ namespace Tommy
             return sb.ToString();
         }
 
+        public delegate bool TryDateParseDelegate<T>(string s, string format, IFormatProvider ci, DateTimeStyles dts, out T dt);
+        
         public static bool TryParseDateTime<T>(string s,
                                                string[] formats,
                                                DateTimeStyles styles,
-                                               Func<string, string, CultureInfo, DateTimeStyles, T> parser,
+                                               TryDateParseDelegate<T> parser,
                                                out T dateTime,
                                                out int parsedFormat)
         {
@@ -2035,15 +2050,7 @@ namespace Tommy
             for (var i = 0; i < formats.Length; i++)
             {
                 var format = formats[i];
-                try
-                {
-                    dateTime = parser(s, format, CultureInfo.InvariantCulture, styles);
-                }
-                catch (Exception)
-                {
-                    continue;
-                }
-
+                if (!parser(s, format, CultureInfo.InvariantCulture, styles, out dateTime)) continue;
                 parsedFormat = i;
                 return true;
             }
